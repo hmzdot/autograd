@@ -29,23 +29,20 @@ pub fn Tensor(comptime T: type) type {
         }
 
         /// Initialize with owned data
-        pub fn initFromOwned(size: []const usize, data: []T, allocator: Allocator) !Tensor(T) {
+        pub fn initFromOwned(size: []usize, data: []T, allocator: Allocator) !Tensor(T) {
             var size_total: usize = 1;
             for (size) |s| {
                 size_total *= s;
             }
             std.debug.assert(size_total == data.len);
 
-            const size_heap = try allocator.alloc(usize, size.len);
-            @memcpy(size_heap, size);
-
             const stride_heap = try allocator.alloc(usize, size.len);
-            buildStride(size_heap, stride_heap);
+            buildStride(size, stride_heap);
 
             return Self{
                 .allocator = allocator,
                 .data = data,
-                .size = size_heap,
+                .size = size,
                 .stride = stride_heap,
             };
         }
@@ -97,14 +94,17 @@ pub fn add(comptime T: type, a: *const Tensor(T), b: *const Tensor(T)) !Tensor(T
     } else true;
     std.debug.assert(same_size);
 
+    const size: []usize = try a.allocator.alloc(usize, a.size.len);
+    @memcpy(size, a.size);
+
     var c_data: []T = try a.allocator.alloc(T, a.data.len);
     for (a.data, b.data, 0..) |ai, bi, i| {
         c_data[i] = ai + bi;
     }
-    return Tensor(T).initFromOwned(a.size, c_data, a.allocator);
+    return Tensor(T).initFromOwned(size, c_data, a.allocator);
 }
 
-pub fn mul(comptime T: type, a: *const Tensor(T), b: *const Tensor(T)) !void {
+pub fn mul(comptime T: type, a: *const Tensor(T), b: *const Tensor(T)) !Tensor(T) {
     const a_end = a.size.len - 1;
     std.debug.assert(a.size[a_end] == b.size[0]);
 
@@ -132,7 +132,11 @@ pub fn mul(comptime T: type, a: *const Tensor(T), b: *const Tensor(T)) !void {
         }
     }
 
-    // TODO: Build tensor from c_data
+    var size = try a.allocator.alloc(usize, a.size.len + b.size.len - 2);
+    @memcpy(size[0..a_end], a.size[0..a_end]);
+    @memcpy(size[a_end..], b.size[1..]);
+
+    return Tensor(T).initFromOwned(size, c_data, a.allocator);
 }
 
 test "Tensor::initFromOwned" {
@@ -140,8 +144,10 @@ test "Tensor::initFromOwned" {
     const data = try allocator.alloc(f32, 6);
     for (data, 0..) |*d, i| d.* = @floatFromInt(i);
 
-    const size = [_]usize{ 2, 3 };
-    var t = try Tensor(f32).initFromOwned(&size, data, allocator);
+    const size = try allocator.alloc(usize, 2);
+    @memcpy(size, &[_]usize{ 2, 3 });
+
+    var t = try Tensor(f32).initFromOwned(size, data, allocator);
     defer t.deinit();
 
     try testing.expectEqual(@as(usize, 2), t.size[0]);
