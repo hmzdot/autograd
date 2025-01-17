@@ -185,3 +185,34 @@ test "add" {
     const expected = [_]f32{ 6, 8, 10, 12 };
     try testing.expectEqualSlices(f32, &expected, c.data);
 }
+
+test "mul" {
+    const allocator = testing.allocator;
+
+    // Test case for 2x3 * 3x2 matrix multiplication
+    const data_a = [_]f32{ 1, 2, 3, 4, 5, 6 }; // 2x3 matrix
+    const size_a = [_]usize{ 2, 3 };
+    const data_b = [_]f32{ 7, 8, 9, 10, 11, 12 }; // 3x2 matrix
+    const size_b = [_]usize{ 3, 2 };
+
+    var a = try Tensor(f32).initFromSlice(&size_a, &data_a, allocator);
+    defer a.deinit();
+    var b = try Tensor(f32).initFromSlice(&size_b, &data_b, allocator);
+    defer b.deinit();
+
+    var c = try mul(f32, &a, &b);
+    defer c.deinit();
+
+    // Expected result should be a 2x2 matrix:
+    // [1 2 3]   [7  8 ]   [58  64]
+    // [4 5 6] * [9  10] = [139 154]
+    //           [11 12]
+    const expected = [_]f32{ 58, 64, 139, 154 };
+
+    // Check dimensions
+    try testing.expectEqual(@as(usize, 2), c.size[0]);
+    try testing.expectEqual(@as(usize, 2), c.size[1]);
+
+    // Check values
+    try testing.expectEqualSlices(f32, &expected, c.data);
+}
