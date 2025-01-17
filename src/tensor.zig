@@ -91,7 +91,7 @@ pub fn Tensor(comptime T: type) type {
     };
 }
 
-fn add(comptime T: type, a: *const Tensor(T), b: *const Tensor(T)) !Tensor(T) {
+pub fn add(comptime T: type, a: *const Tensor(T), b: *const Tensor(T)) !Tensor(T) {
     const same_size = for (a.size, b.size) |ad, bd| {
         if (ad != bd) break false;
     } else true;
@@ -102,6 +102,37 @@ fn add(comptime T: type, a: *const Tensor(T), b: *const Tensor(T)) !Tensor(T) {
         c_data[i] = ai + bi;
     }
     return Tensor(T).initFromOwned(a.size, c_data, a.allocator);
+}
+
+pub fn mul(comptime T: type, a: *const Tensor(T), b: *const Tensor(T)) !void {
+    const a_end = a.size.len - 1;
+    std.debug.assert(a.size[a_end] == b.size[0]);
+
+    const shared_dim = a.size[a_end];
+
+    // Reshape A and B to (-1, v_size)
+    // NOTE: This will change when a.data.len != total size of a
+    const a_dim = a.data.len / shared_dim;
+    const b_dim = b.data.len / shared_dim;
+    const a_stride: [2]usize = .{ shared_dim, 1 };
+    const b_stride: [2]usize = .{ b_dim, 1 };
+
+    // Perform 2x2 matrix multiplication
+    var c_data = try a.allocator.alloc(T, a_dim * b_dim);
+    for (0..a_dim) |ad| {
+        for (0..b_dim) |bd| {
+            const a_offset = a_stride[0] * ad;
+            const b_offset = b_stride[1] * bd;
+
+            var sum: T = 0;
+            for (0..shared_dim) |vi| {
+                sum += a.data[a_offset + vi * a_stride[1]] * b.data[b_offset + vi * b_stride[0]];
+            }
+            c_data[ad * b_dim + bd] = sum;
+        }
+    }
+
+    // TODO: Build tensor from c_data
 }
 
 test "Tensor::initFromOwned" {
