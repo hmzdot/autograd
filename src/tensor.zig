@@ -2,12 +2,44 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
+const Op = enum { add, mul, none };
+
+fn Graph(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        allocator: Allocator,
+        operation: Op,
+        operands: ?[]*Tensor(T),
+
+        pub fn init(op: Op, operands: []const *Tensor(T), allocator: Allocator) !Graph(T) {
+            const operands_heap = try allocator.alloc(*Tensor(T), operands.len);
+            @memcpy(operands_heap, operands[0..]);
+
+            return Self{
+                .allocator = allocator,
+                .operation = op,
+                .operands = operands_heap,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (self.operands) |ops| self.allocator.free(ops);
+            self.allocator.destroy(self);
+        }
+    };
+}
+
 /// Tensor over generic T
 pub fn Tensor(comptime T: type) type {
     return struct {
         const Self = @This();
 
         allocator: Allocator,
+
+        gradient: ?[]T,
+        comp_graph: ?*Graph(T),
+
         data: []T,
         size: []usize,
         stride: []usize,
@@ -44,6 +76,8 @@ pub fn Tensor(comptime T: type) type {
                 .data = data,
                 .size = size,
                 .stride = stride_heap,
+                .gradient = null,
+                .comp_graph = null,
             };
         }
 
@@ -69,6 +103,33 @@ pub fn Tensor(comptime T: type) type {
                 .data = data_heap,
                 .size = size_heap,
                 .stride = stride_heap,
+                .gradient = null,
+                .comp_graph = null,
+            };
+        }
+
+        pub fn ones(size: []const usize, allocator: Allocator) !Tensor(T) {
+            var num_elements = 1;
+            for (size) |s| num_elements *= s;
+
+            const data_heap = try allocator.alloc(T, num_elements);
+            for (0..num_elements) |i| {
+                data_heap[i] = 1;
+            }
+
+            const size_heap = try allocator.alloc(usize, size.len);
+            @memcpy(size_heap, size);
+
+            const stride_heap = try allocator.alloc(usize, size.len);
+            buildStride(size_heap, stride_heap);
+
+            return Self{
+                .allocator = allocator,
+                .data = data_heap,
+                .size = size_heap,
+                .stride = stride_heap,
+                .gradient = null,
+                .comp_graph = null,
             };
         }
 
@@ -76,6 +137,60 @@ pub fn Tensor(comptime T: type) type {
             self.allocator.free(self.data);
             self.allocator.free(self.size);
             self.allocator.free(self.stride);
+            if (self.comp_graph) |cg| cg.deinit();
+            if (self.gradient) |grad| self.allocator.free(grad);
+        }
+
+        pub fn transpose(
+            self: *Tensor(T),
+            allocator: *Allocator,
+            dim0: usize,
+            dim1: usize,
+        ) !Tensor(T) {
+            if (dim0 >= self.size.len or dim1 >= self.size.len) {
+                return error.InvalidDimensions;
+            }
+
+            var new_size = try allocator.alloc(usize, self.size.len);
+            var new_stride = try allocator.alloc(usize, self.stride.len);
+
+            // Copy the original sizes and strides into the new ones
+            for (self.size, 0..) |size, i| {
+                new_size[i] = size;
+            }
+            for (self.stride, 0..) |stride, i| {
+                new_stride[i] = stride;
+            }
+
+            // Swap the dimensions
+            const temp_size = new_size[dim0];
+            new_size[dim0] = new_size[dim1];
+            new_size[dim1] = temp_size;
+
+            const temp_stride = new_stride[dim0];
+            new_stride[dim0] = new_stride[dim1];
+            new_stride[dim1] = temp_stride;
+
+            return Tensor(T){
+                .allocator = allocator,
+                .gradient = null,
+                .comp_graph = null,
+                .data = self.data,
+                .size = new_size,
+                .stride = new_stride,
+            };
+        }
+
+        pub fn contigious(self: *Tensor(T), allocator: *Allocator) !Tensor(T) {
+            // Calculate the total number of elements
+            var num_elements: usize = 1;
+            for (self.size) |s| num_elements *= s;
+
+            // var new_data = try allocator.alloc(T, num_elements);
+            // var new_stride = try allocator.alloc(usize, self.stride.len);
+
+            allocator;
+            return error.FigureOutStridesFirst;
         }
 
         /// Print data
@@ -88,7 +203,7 @@ pub fn Tensor(comptime T: type) type {
     };
 }
 
-pub fn add(comptime T: type, a: *const Tensor(T), b: *const Tensor(T)) !Tensor(T) {
+pub fn add(comptime T: type, a: *Tensor(T), b: *Tensor(T)) !Tensor(T) {
     const same_size = for (a.size, b.size) |ad, bd| {
         if (ad != bd) break false;
     } else true;
@@ -101,10 +216,13 @@ pub fn add(comptime T: type, a: *const Tensor(T), b: *const Tensor(T)) !Tensor(T
     for (a.data, b.data, 0..) |ai, bi, i| {
         c_data[i] = ai + bi;
     }
-    return Tensor(T).initFromOwned(size, c_data, a.allocator);
+    var t = try Tensor(T).initFromOwned(size, c_data, a.allocator);
+    t.comp_graph = try a.allocator.create(Graph(T));
+    t.comp_graph.?.* = try Graph(T).init(Op.add, &.{ a, b }, a.allocator);
+    return t;
 }
 
-pub fn mul(comptime T: type, a: *const Tensor(T), b: *const Tensor(T)) !Tensor(T) {
+pub fn mul(comptime T: type, a: *Tensor(T), b: *Tensor(T)) !Tensor(T) {
     const a_end = a.size.len - 1;
     std.debug.assert(a.size[a_end] == b.size[0]);
 
@@ -136,7 +254,55 @@ pub fn mul(comptime T: type, a: *const Tensor(T), b: *const Tensor(T)) !Tensor(T
     @memcpy(size[0..a_end], a.size[0..a_end]);
     @memcpy(size[a_end..], b.size[1..]);
 
-    return Tensor(T).initFromOwned(size, c_data, a.allocator);
+    var t = try Tensor(T).initFromOwned(size, c_data, a.allocator);
+    t.comp_graph = try a.allocator.create(Graph(T));
+    t.comp_graph.?.* = try Graph(T).init(Op.mul, &.{ a, b }, a.allocator);
+    return t;
+}
+
+pub fn backward(comptime T: type, t: *Tensor(T)) !void {
+    if (t.gradient == null) {
+        t.gradient = try t.allocator.alloc(T, t.data.len);
+        var i: usize = 0;
+        while (i < t.data.len) : (i += 1) {
+            t.gradient.?[i] = 1;
+        }
+    }
+
+    if (t.comp_graph) |cg| {
+        switch (cg.operation) {
+            .add => {
+                const op0 = cg.operands.?[0]; // left operand
+                if (op0.gradient == null) {
+                    op0.gradient = try op0.allocator.alloc(T, op0.data.len);
+                    @memset(op0.gradient.?, 0);
+                }
+
+                const op1 = cg.operands.?[1]; // right operand
+                if (op1.gradient == null) {
+                    op1.gradient = try op1.allocator.alloc(T, op1.data.len);
+                    @memset(op1.gradient.?, 0);
+                }
+
+                // propagate gradients to parents
+                const grad0 = op0.gradient.?;
+                const grad1 = op1.gradient.?;
+                var i: usize = 0;
+                while (i < t.data.len) : (i += 1) {
+                    grad0[i] += t.gradient.?[i];
+                    grad1[i] += t.gradient.?[i];
+                }
+
+                // recursively call backward() on parents
+                try backward(T, op0);
+                try backward(T, op1);
+            },
+            .mul => {
+                return error.HandleTransposeFirst;
+            },
+            .none => return,
+        }
+    }
 }
 
 test "Tensor::initFromOwned" {
@@ -184,6 +350,15 @@ test "add" {
 
     const expected = [_]f32{ 6, 8, 10, 12 };
     try testing.expectEqualSlices(f32, &expected, c.data);
+
+    // Check computation graph
+    try testing.expect(c.comp_graph != null);
+    try testing.expectEqual(c.comp_graph.?.operation, Op.add);
+    try testing.expectEqualSlices(
+        *const Tensor(f32),
+        c.comp_graph.?.operands.?,
+        &.{ &a, &b },
+    );
 }
 
 test "mul" {
@@ -215,4 +390,61 @@ test "mul" {
 
     // Check values
     try testing.expectEqualSlices(f32, &expected, c.data);
+
+    // Check computation graph
+    try testing.expect(c.comp_graph != null);
+    try testing.expectEqual(c.comp_graph.?.operation, Op.mul);
+    try testing.expectEqualSlices(
+        *const Tensor(f32),
+        c.comp_graph.?.operands.?,
+        &.{ &a, &b },
+    );
+}
+
+test "backward (add)" {
+    const allocator = testing.allocator;
+
+    // Create two tensors a and b
+    const data_a = [_]f32{ 1, 2, 3, 4 };
+    const data_b = [_]f32{ 5, 6, 7, 8 };
+    const size = [_]usize{ 2, 2 };
+
+    var a = try Tensor(f32).initFromSlice(&size, &data_a, allocator);
+    defer a.deinit();
+    var b = try Tensor(f32).initFromSlice(&size, &data_b, allocator);
+    defer b.deinit();
+
+    // Perform addition
+    var c = try add(f32, &a, &b);
+    defer c.deinit();
+
+    // Perform backward pass
+    try backward(f32, &c);
+
+    // Check gradients
+    const expected_grad = [_]f32{ 1, 1, 1, 1 };
+    try testing.expectEqualSlices(f32, &expected_grad, a.gradient.?);
+    try testing.expectEqualSlices(f32, &expected_grad, b.gradient.?);
+}
+
+test "backward (add) #2" {
+    const allocator = testing.allocator;
+
+    // Create two tensors a and b
+    const data = [_]f32{ 1, 2, 3, 4 };
+    const size = [_]usize{ 2, 2 };
+
+    var a = try Tensor(f32).initFromSlice(&size, &data, allocator);
+    defer a.deinit();
+
+    // Perform addition
+    var c = try add(f32, &a, &a);
+    defer c.deinit();
+
+    // Perform backward pass
+    try backward(f32, &c);
+
+    // Check gradients
+    const expected_grad = [_]f32{ 2, 2, 2, 2 };
+    try testing.expectEqualSlices(f32, &expected_grad, a.gradient.?);
 }
