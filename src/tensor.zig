@@ -6,6 +6,17 @@ const Allocator = std.mem.Allocator;
 
 const Op = enum { add, mul, none };
 
+fn printSlice(comptime T: type, slice: []const T) void {
+    std.debug.print("[", .{});
+    for (slice[0..(slice.len - 1)]) |s| {
+        std.debug.print("{},", .{s});
+    }
+    if (slice.len > 0) {
+        std.debug.print("{}", .{slice[slice.len - 1]});
+    }
+    std.debug.print("]", .{});
+}
+
 // Tensor iterator that respects stride
 fn Iterator(comptime T: type) type {
     return struct {
@@ -151,7 +162,7 @@ pub fn Tensor(comptime T: type) type {
         }
 
         pub fn ones(size: []const usize, allocator: Allocator) !Tensor(T) {
-            var num_elements = 1;
+            var num_elements: usize = 1;
             for (size) |s| num_elements *= s;
 
             const data_heap = try allocator.alloc(T, num_elements);
@@ -223,22 +234,29 @@ pub fn Tensor(comptime T: type) type {
             };
         }
 
-        pub fn contigious(self: *Tensor(T), allocator: *Allocator) !Tensor(T) {
-            // Calculate the total number of elements
-            var num_elements: usize = 1;
-            for (self.size) |s| num_elements *= s;
+        pub fn contiguous(self: *Tensor(T)) !void {
+            var data = try self.allocator.alloc(T, self.data.len);
+            var it = Iterator(T).fromTensor(self);
 
-            // var new_data = try allocator.alloc(T, num_elements);
-            // var new_stride = try allocator.alloc(usize, self.stride.len);
+            var next = it.next();
+            while (next != null) : (next = it.next()) {
+                data[it.index - 1] = next.?;
+            }
 
-            allocator;
-            return error.FigureOutStridesFirst;
+            // Replace data with contiguous one
+            self.allocator.free(self.data);
+            self.data = data;
+
+            // Build stride from scratch, as it might be invalidated
+            buildStride(self.size, self.stride);
         }
 
         /// Print data
         pub fn print(self: *Tensor(T)) void {
-            for (self.data) |d| {
-                std.debug.print("{} ", .{d});
+            var it = Iterator(T).fromTensor(self);
+            var next = it.next();
+            while (next != null) : (next = it.next()) {
+                std.debug.print("{} ", .{next.?});
             }
             std.debug.print("\n", .{});
         }

@@ -3,28 +3,37 @@ const std = @import("std");
 const tensor = @import("./tensor.zig");
 const Tensor = tensor.Tensor;
 
+fn printSlice(comptime T: type, slice: []const T) void {
+    std.debug.print("[", .{});
+    for (slice[0..(slice.len - 1)]) |s| {
+        std.debug.print("{},", .{s});
+    }
+    if (slice.len > 0) {
+        std.debug.print("{}", .{slice[slice.len - 1]});
+    }
+    std.debug.print("]", .{});
+}
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const data = try allocator.alloc(u32, 9);
-    for (data, 0..) |*d, i| d.* = @intCast(i);
+    var t = try Tensor(u32).initFromSlice(
+        &.{ 6, 2, 1 },
+        &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 },
+        allocator,
+    );
 
-    const size = [_]usize{ 3, 3 };
-    var t = try Tensor(u32).initFromOwned(&size, data, allocator);
-    defer t.deinit();
+    std.debug.print("size: ", .{});
+    printSlice(usize, t.size);
+    std.debug.print("\n", .{});
 
-    const t1_size = [_]usize{ 4, 3, 2 };
-    const t1_data = .{ 7, 1, 2, 2, 2, 4, 1, 1, 1, 1, 7, 1, 4, 9, 1, 5, 9, 6, 9, 3, 5, 9, 4, 1 };
-    var t1 = try Tensor(u32).initFromSlice(&t1_size, &t1_data, allocator);
-    defer t1.deinit();
+    std.debug.print("stride: ", .{});
+    printSlice(usize, t.stride);
+    std.debug.print("\n", .{});
 
-    const t2_size = [_]usize{ 2, 1 };
-    const t2_data = .{ 1, 7 };
-    var t2 = try Tensor(u32).initFromSlice(&t2_size, &t2_data, allocator);
-    defer t2.deinit();
+    try t.contiguous();
 
-    // tensor([[[14], [16], [30]], [[ 8], [ 8], [14]], [[67], [36], [51]], [[30], [68], [11]]])
-    try tensor.mul(u32, &t1, &t2);
+    t.print();
 }
