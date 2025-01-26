@@ -2,7 +2,49 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
+// TODO: Consider the empty tensor
+
 const Op = enum { add, mul, none };
+
+// Tensor iterator that respects stride
+fn Iterator(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        data: []T,
+        stride: []const usize,
+        size: []const usize,
+        index: usize,
+        total: usize,
+
+        pub fn fromTensor(tensor: *Tensor(T)) Self {
+            var total: usize = 1;
+            for (tensor.size) |s| total *= s;
+
+            return Iterator(T){
+                .data = tensor.data,
+                .stride = tensor.stride,
+                .size = tensor.size,
+                .index = 0,
+                .total = total,
+            };
+        }
+
+        pub fn next(self: *Self) ?T {
+            if (self.index >= self.total) {
+                return null;
+            } else {
+                var offset: usize = 0;
+                for (self.stride, self.size) |st, sz| {
+                    offset += ((self.index / st) % sz) * st;
+                }
+
+                self.index += 1;
+                return self.data[offset];
+            }
+        }
+    };
+}
 
 fn Graph(comptime T: type) type {
     return struct {
