@@ -207,6 +207,11 @@ pub fn Tensor(comptime T: type) type {
                 return error.InvalidDimensions;
             }
 
+            // TODO: Copying data here makes everything pointless, but currently
+            // there's no mechanism to refcount.
+            const new_data = try self.allocator.alloc(T, self.data.len);
+            @memcpy(new_data, self.data);
+
             var new_size = try self.allocator.alloc(usize, self.size.len);
             var new_stride = try self.allocator.alloc(usize, self.stride.len);
 
@@ -231,7 +236,7 @@ pub fn Tensor(comptime T: type) type {
                 .allocator = self.allocator,
                 .gradient = null,
                 .comp_graph = null,
-                .data = self.data,
+                .data = new_data,
                 .size = new_size,
                 .stride = new_stride,
             };
@@ -396,6 +401,62 @@ test "Tensor::initFromSlice" {
     try testing.expectEqual(@as(usize, 2), t.size[0]);
     try testing.expectEqual(@as(usize, 3), t.size[1]);
     try testing.expectEqualSlices(f32, &data, t.data);
+}
+
+test "Tensor::ones" {
+    const allocator = testing.allocator;
+    const size = [_]usize{ 2, 3 };
+
+    var t = try Tensor(f32).ones(&size, allocator);
+    defer t.deinit();
+
+    const expected = [_]f32{ 1, 1, 1, 1, 1, 1 };
+    try testing.expectEqualSlices(f32, &expected, t.data);
+    try testing.expectEqual(@as(usize, 2), t.size[0]);
+    try testing.expectEqual(@as(usize, 3), t.size[1]);
+}
+
+test "Tensor::transpose" {
+    const allocator = testing.allocator;
+    const data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const size = [_]usize{ 2, 3 };
+
+    var t = try Tensor(f32).initFromSlice(&size, &data, allocator);
+    defer t.deinit();
+
+    var t_transposed = try t.transpose(0, 1);
+    defer t_transposed.deinit();
+
+    // Make transpose contiguous so that
+    try t_transposed.contiguous();
+
+    const expected_data = [_]f32{ 1, 4, 2, 5, 3, 6 };
+    const expected_size = [_]usize{ 3, 2 };
+
+    try testing.expectEqualSlices(f32, &expected_data, t_transposed.data);
+    try testing.expectEqualSlices(usize, &expected_size, t_transposed.size);
+}
+
+test "Tensor::contiguous" {
+    const allocator = testing.allocator;
+    const data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const size = [_]usize{ 2, 3 };
+
+    var t = try Tensor(f32).initFromSlice(&size, &data, allocator);
+    defer t.deinit();
+
+    // Transpose to make it non-contiguous
+    var t_transposed = try t.transpose(0, 1);
+    defer t_transposed.deinit();
+
+    // Make it contiguous
+    try t_transposed.contiguous();
+
+    const expected_data = [_]f32{ 1, 4, 2, 5, 3, 6 };
+    const expected_size = [_]usize{ 3, 2 };
+
+    try testing.expectEqualSlices(f32, &expected_data, t_transposed.data);
+    try testing.expectEqualSlices(usize, &expected_size, t_transposed.size);
 }
 
 test "add" {
