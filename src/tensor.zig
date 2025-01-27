@@ -46,10 +46,14 @@ fn Iterator(comptime T: type) type {
                 return null;
             } else {
                 var offset: usize = 0;
-                for (self.stride, self.size) |st, sz| {
-                    offset += ((self.index / st) % sz) * st;
+                var rem_index = self.index;
+                var dim_index = self.size.len;
+                while (dim_index > 0) : (dim_index -= 1) {
+                    const st = self.stride[dim_index - 1];
+                    const sz = self.size[dim_index - 1];
+                    offset += (rem_index % sz) * st;
+                    rem_index /= sz;
                 }
-
                 self.index += 1;
                 return self.data[offset];
             }
@@ -196,7 +200,6 @@ pub fn Tensor(comptime T: type) type {
 
         pub fn transpose(
             self: *Tensor(T),
-            allocator: *Allocator,
             dim0: usize,
             dim1: usize,
         ) !Tensor(T) {
@@ -204,8 +207,8 @@ pub fn Tensor(comptime T: type) type {
                 return error.InvalidDimensions;
             }
 
-            var new_size = try allocator.alloc(usize, self.size.len);
-            var new_stride = try allocator.alloc(usize, self.stride.len);
+            var new_size = try self.allocator.alloc(usize, self.size.len);
+            var new_stride = try self.allocator.alloc(usize, self.stride.len);
 
             // Copy the original sizes and strides into the new ones
             for (self.size, 0..) |size, i| {
@@ -225,7 +228,7 @@ pub fn Tensor(comptime T: type) type {
             new_stride[dim1] = temp_stride;
 
             return Tensor(T){
-                .allocator = allocator,
+                .allocator = self.allocator,
                 .gradient = null,
                 .comp_graph = null,
                 .data = self.data,
@@ -253,6 +256,7 @@ pub fn Tensor(comptime T: type) type {
 
         /// Print data
         pub fn print(self: *Tensor(T)) void {
+            std.debug.print("===\n", .{});
             var it = Iterator(T).fromTensor(self);
             var next = it.next();
             while (next != null) : (next = it.next()) {

@@ -19,8 +19,14 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
+    // size: (2, 3, 2)
+    // stride: (6, 2, 1)
+    // tensor: [
+    //   [ [ 1, 2 ], [ 3, 4 ], [ 5, 6 ] ],
+    //   [ [ 7, 8 ], [ 9, a ], [ b, c ] ],
+    // ]
     var t = try Tensor(u32).initFromSlice(
-        &.{ 6, 2, 1 },
+        &.{ 2, 3, 2 },
         &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 },
         allocator,
     );
@@ -34,6 +40,24 @@ pub fn main() !void {
     std.debug.print("\n", .{});
 
     try t.contiguous();
+
+    t.print();
+    // size: (3, 2, 2)
+    // stride: (2, 6, 1)
+    // tensor: [
+    //   [ [ 1, 2 ], [ 7, 8 ] ],
+    //   [ [ 3, 4 ], [ 9, a ] ],
+    //   [ [ 5, 6 ], [ b, c ] ],
+    // ]
+    t = try t.transpose(0, 1);
+
+    std.debug.print("size: ", .{});
+    printSlice(usize, t.size);
+    std.debug.print("\n", .{});
+
+    std.debug.print("stride: ", .{});
+    printSlice(usize, t.stride);
+    std.debug.print("\n", .{});
 
     t.print();
 }
