@@ -29,7 +29,7 @@ fn Iterator(comptime T: type) type {
         index: usize,
         total: usize,
 
-        pub fn fromTensor(tensor: *Tensor(T)) Self {
+        pub fn fromTensor(tensor: *const Tensor(T)) Self {
             var total: usize = 1;
             for (tensor.size) |s| total *= s;
 
@@ -271,11 +271,11 @@ pub fn Tensor(comptime T: type) type {
         }
 
         // Convenience functions for arithmetics
+
         pub fn add_(self: *Self, other: *Self) !Self {
             return add(T, self, other);
         }
 
-        // Convenience functions for arithmetics
         pub fn mul_(self: *Self, other: *Self) !Self {
             return mul(T, self, other);
         }
@@ -291,11 +291,16 @@ pub fn add(comptime T: type, a: *Tensor(T), b: *Tensor(T)) !Tensor(T) {
     const size: []usize = try a.allocator.alloc(usize, a.size.len);
     @memcpy(size, a.size);
 
-    var c_data: []T = try a.allocator.alloc(T, a.data.len);
-    for (a.data, b.data, 0..) |ai, bi, i| {
-        c_data[i] = ai + bi;
+    var data: []T = try a.allocator.alloc(T, a.data.len);
+    var a_it = Iterator(T).fromTensor(a);
+    var b_it = Iterator(T).fromTensor(b);
+    while (true) {
+        const a_next = a_it.next() orelse break;
+        const b_next = b_it.next() orelse break;
+        data[a_it.index - 1] = a_next + b_next;
     }
-    var t = try Tensor(T).initFromOwned(size, c_data, a.allocator);
+
+    var t = try Tensor(T).initFromOwned(size, data, a.allocator);
     t.comp_graph = try a.allocator.create(Graph(T));
     t.comp_graph.?.* = try Graph(T).init(Op.add, &.{ a, b }, a.allocator);
     return t;
