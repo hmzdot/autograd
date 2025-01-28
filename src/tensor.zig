@@ -3,6 +3,7 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
 // TODO: Consider the empty tensor
+// TODO: Update add and mul to respect strides
 
 const Op = enum { add, mul, none };
 
@@ -261,13 +262,22 @@ pub fn Tensor(comptime T: type) type {
 
         /// Print data
         pub fn print(self: *Tensor(T)) void {
-            std.debug.print("===\n", .{});
             var it = Iterator(T).fromTensor(self);
             var next = it.next();
             while (next != null) : (next = it.next()) {
                 std.debug.print("{} ", .{next.?});
             }
             std.debug.print("\n", .{});
+        }
+
+        // Convenience functions for arithmetics
+        pub fn add_(self: *Self, other: *Self) !Self {
+            return add(T, self, other);
+        }
+
+        // Convenience functions for arithmetics
+        pub fn mul_(self: *Self, other: *Self) !Self {
+            return mul(T, self, other);
         }
     };
 }
@@ -362,12 +372,55 @@ pub fn backward(comptime T: type, t: *Tensor(T)) !void {
                     grad1[i] += t.gradient.?[i];
                 }
 
-                // recursively call backward() on parents
                 try backward(T, op0);
                 try backward(T, op1);
             },
             .mul => {
-                return error.HandleTransposeFirst;
+                const op0 = cg.operands.?[0]; // left operand
+                if (op0.gradient == null) {
+                    op0.gradient = try op0.allocator.alloc(T, op0.data.len);
+                    @memset(op0.gradient.?, 0);
+                }
+
+                const op1 = cg.operands.?[1]; // right operand
+                if (op1.gradient == null) {
+                    op1.gradient = try op1.allocator.alloc(T, op1.data.len);
+                    @memset(op1.gradient.?, 0);
+                }
+
+                var grad_in = try Tensor(T).initFromSlice(
+                    op0.size,
+                    t.gradient.?,
+                    op0.allocator,
+                );
+
+                // ∂C/∂A = ∂C · Bᵀ
+                var transposed_op1 = try op1.transpose(0, 1);
+                try transposed_op1.contiguous();
+                var grad0_result = try grad_in.mul_(&transposed_op1);
+
+                // ∂C/∂B = Aᵀ · ∂C
+                var transposed_op0 = try op0.transpose(0, 1);
+                try transposed_op0.contiguous();
+                var grad1_result = try transposed_op0.mul_(&grad_in);
+
+                // accumulate gradients
+                for (op0.gradient.?, grad0_result.data) |*grad, data| {
+                    grad.* += data;
+                }
+                for (op1.gradient.?, grad1_result.data) |*grad, data| {
+                    grad.* += data;
+                }
+
+                // clean up temporary tensors
+                grad0_result.deinit();
+                grad1_result.deinit();
+                transposed_op1.deinit();
+                transposed_op0.deinit();
+                grad_in.deinit();
+
+                try backward(T, op0);
+                try backward(T, op1);
             },
             .none => return,
         }
