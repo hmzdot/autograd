@@ -20,20 +20,20 @@ pub fn main() !void {
     const ator = arena.allocator();
 
     var in0 = try Tensor(f32).initFromSlice(
-        .{ 2, 2 },
-        .{ 1, 2, 3, 4 },
+        &.{ 2, 2 },
+        &.{ 1, 2, 3, 4 },
         ator,
     );
     defer in0.deinit();
     var in1 = try Tensor(f32).initFromSlice(
-        .{ 2, 2 },
-        .{ 5, 6, 7, 8 },
+        &.{ 2, 2 },
+        &.{ 5, 6, 7, 8 },
         ator,
     );
     defer in1.deinit();
     var in2 = try Tensor(f32).initFromSlice(
-        .{ 2, 2 },
-        .{ 9, 10, 11, 12 },
+        &.{ 2, 2 },
+        &.{ 9, 10, 11, 12 },
         ator,
     );
     defer in2.deinit();
@@ -47,11 +47,9 @@ pub fn main() !void {
     // Perform backward pass and calculate gradients
     try out1.backward();
 
-    inline for (.{ in0, in1, in2 }, 0..) |in_maybe, i| {
-        if (in_maybe) |in| {
-            std.debug.print("Grad in{}: ", .{i});
-            printSlice(f32, in.gradient.?);
-            std.debug.print("\n", .{});
-        }
+    inline for (.{ in0, in1, in2 }, 0..) |in, i| {
+        std.debug.print("Grad in{}: ", .{i});
+        printSlice(f32, in.gradient.?);
+        std.debug.print("\n", .{});
     }
 }

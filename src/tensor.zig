@@ -4,7 +4,6 @@ const Allocator = std.mem.Allocator;
 
 // TODO: Consider the empty tensor
 // TODO: Add refcount
-// TODO: Update add and mul to respect strides
 
 const Op = enum { add, mul, none };
 
@@ -16,7 +15,7 @@ fn printSlice(comptime T: type, slice: []const T) void {
     if (slice.len > 0) {
         std.debug.print("{}", .{slice[slice.len - 1]});
     }
-    std.debug.print("]", .{});
+    std.debug.print("]\n", .{});
 }
 
 // Tensor iterator that respects stride
@@ -167,6 +166,26 @@ pub fn Tensor(comptime T: type) type {
             };
         }
 
+        pub fn clone(self: *const Self) !Tensor(T) {
+            const data_heap = try self.allocator.alloc(T, self.data.len);
+            @memcpy(data_heap, self.data);
+
+            const size_heap = try self.allocator.alloc(usize, self.size.len);
+            @memcpy(size_heap, self.size);
+
+            const stride_heap = try self.allocator.alloc(usize, self.stride.len);
+            @memcpy(stride_heap, self.stride);
+
+            return Self{
+                .allocator = self.allocator,
+                .data = data_heap,
+                .size = size_heap,
+                .stride = stride_heap,
+                .gradient = null,
+                .comp_graph = null,
+            };
+        }
+
         pub fn ones(size: []const usize, allocator: Allocator) !Tensor(T) {
             var num_elements: usize = 1;
             for (size) |s| num_elements *= s;
@@ -192,7 +211,7 @@ pub fn Tensor(comptime T: type) type {
             };
         }
 
-        pub fn deinit(self: *Tensor(T)) void {
+        pub fn deinit(self: *Self) void {
             self.allocator.free(self.data);
             self.allocator.free(self.size);
             self.allocator.free(self.stride);
@@ -201,7 +220,7 @@ pub fn Tensor(comptime T: type) type {
         }
 
         pub fn transpose(
-            self: *const Tensor(T),
+            self: *const Self,
             dim0: usize,
             dim1: usize,
         ) !Tensor(T) {
@@ -239,7 +258,19 @@ pub fn Tensor(comptime T: type) type {
             };
         }
 
-        pub fn contiguous(self: *Tensor(T)) !void {
+        pub fn is_contiguous(self: *const Self) bool {
+            const stride_len = self.stride.len;
+            if (stride_len == 1) return true;
+
+            for (0..(self.stride.len - 1)) |i| {
+                if (self.stride[i] < self.stride[i + 1]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        pub fn contiguous(self: *Self) !void {
             var data = try self.allocator.alloc(T, self.data.len);
             var it = Iterator(T).fromTensor(self);
 
@@ -256,8 +287,37 @@ pub fn Tensor(comptime T: type) type {
             buildStride(self.size, self.stride);
         }
 
+        // Returns total number of items
+        pub fn numel(self: *Self) usize {
+            var n: usize = 1;
+            for (self.size) |s| n *= s;
+            return n;
+        }
+
+        fn is_reshape_valid(old: []const usize, new: []const usize) bool {
+            var old_size: usize = 1;
+            for (old) |o| old_size *= o;
+
+            var new_size: usize = 1;
+            for (new) |n| new_size *= n;
+
+            return old_size == new_size;
+        }
+
+        pub fn resize(self: *Self, new_size: []const usize) !Self {
+            if (!is_reshape_valid(self.size, new_size)) {
+                return error.IncompatibleSize;
+            }
+            var tensor = try self.clone();
+            if (!tensor.is_contiguous()) try tensor.contiguous();
+
+            @memcpy(tensor.size, new_size);
+            buildStride(tensor.size, tensor.stride);
+            return tensor;
+        }
+
         /// Print data
-        pub fn print(self: *Tensor(T)) void {
+        pub fn print(self: *Self) void {
             var it = Iterator(T).fromTensor(self);
             var next = it.next();
             while (next != null) : (next = it.next()) {
@@ -313,29 +373,25 @@ pub fn _matmul(comptime T: type, a: *Tensor(T), b: *Tensor(T)) !Tensor(T) {
     const shared_dim = a.size[a_end];
 
     // Reshape A and B to (-1, v_size)
-    var a_dim: usize = 1;
-    for (a.size[0..(a.size.len - 1)]) |s| a_dim *= s;
+    const a_dim: usize = a.numel() / shared_dim;
+    var a_2d = try a.resize(&.{ a_dim, shared_dim });
+    defer a_2d.deinit();
 
-    var b_dim: usize = 1;
-    for (b.size[1..]) |s| b_dim *= s;
-
-    const a_stride: [2]usize = .{ a.stride[0], a.stride[a.stride.len - 1] };
-    const b_stride: [2]usize = .{ b.stride[0], b.stride[b.stride.len - 1] };
+    const b_dim: usize = b.numel() / shared_dim;
+    var b_2d = try b.resize(&.{ shared_dim, b_dim });
+    defer b_2d.deinit();
 
     // Perform 2x2 matrix multiplication
     var c_data = try a.allocator.alloc(T, a_dim * b_dim);
     for (0..a_dim) |ad| {
         for (0..b_dim) |bd| {
-            const a_offset = a_stride[0] * ad;
-            const b_offset = b_stride[1] * bd;
+            const a_offset = a_2d.stride[0] * ad;
+            const b_offset = b_2d.stride[1] * bd;
 
             var sum: T = 0;
-            std.debug.print("c[{}] = \n", .{ad * b_dim + bd});
             for (0..shared_dim) |vi| {
-                std.debug.print("sum += a[{}] * b[{}]\n", .{ a_offset + vi * a_stride[1], b_offset + vi * b_stride[0] });
-                sum += a.data[a_offset + vi * a_stride[1]] * b.data[b_offset + vi * b_stride[0]];
+                sum += a_2d.data[a_offset + vi * a_2d.stride[1]] * b_2d.data[b_offset + vi * b_2d.stride[0]];
             }
-            std.debug.print("\n", .{});
             c_data[ad * b_dim + bd] = sum;
         }
     }
@@ -407,12 +463,10 @@ pub fn _backward(comptime T: type, t: *Tensor(T)) !void {
 
                 // ∂C/∂A = ∂C · Bᵀ
                 var transposed_op1 = try op1.transpose(0, 1);
-                // try transposed_op1.contiguous();
                 var grad0_result = try grad_in.matmul(&transposed_op1);
 
                 // ∂C/∂B = Aᵀ · ∂C
                 var transposed_op0 = try op0.transpose(0, 1);
-                // try transposed_op0.contiguous();
                 var grad1_result = try transposed_op0.matmul(&grad_in);
 
                 // accumulate gradients
@@ -501,6 +555,25 @@ test "Tensor::transpose" {
     try testing.expectEqualSlices(usize, &expected_size, t_transposed.size);
 }
 
+test "Tensor::is_contiguous" {
+    const allocator = testing.allocator;
+    const data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const size = [_]usize{ 2, 3 };
+
+    var t = try Tensor(f32).initFromSlice(&size, &data, allocator);
+    defer t.deinit();
+
+    try testing.expect(t.is_contiguous());
+
+    var t_transposed = try t.transpose(0, 1);
+    defer t_transposed.deinit();
+
+    try testing.expect(!t_transposed.is_contiguous());
+
+    try t_transposed.contiguous();
+    try testing.expect(t_transposed.is_contiguous());
+}
+
 test "Tensor::contiguous" {
     const allocator = testing.allocator;
     const data = [_]f32{ 1, 2, 3, 4, 5, 6 };
@@ -521,6 +594,51 @@ test "Tensor::contiguous" {
 
     try testing.expectEqualSlices(f32, &expected_data, t_transposed.data);
     try testing.expectEqualSlices(usize, &expected_size, t_transposed.size);
+}
+
+test "Tensor::reshape" {
+    const allocator = testing.allocator;
+    const data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const size = [_]usize{ 2, 3 };
+
+    var t = try Tensor(f32).initFromSlice(&size, &data, allocator);
+    defer t.deinit();
+
+    // Reshape to 3x2
+    const new_size = [_]usize{ 3, 2 };
+    var reshaped_t = try t.resize(&new_size);
+    defer reshaped_t.deinit();
+
+    const expected_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const expected_size = [_]usize{ 3, 2 };
+
+    try testing.expectEqualSlices(f32, &expected_data, reshaped_t.data);
+    try testing.expectEqualSlices(usize, &expected_size, reshaped_t.size);
+}
+
+test "Tensor::reshape non-contiguous" {
+    const allocator = testing.allocator;
+    const data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+
+    var t = try Tensor(f32).initFromSlice(&.{ 3, 2 }, &data, allocator);
+    defer t.deinit();
+
+    var t_transposed = try t.transpose(0, 1);
+    defer t_transposed.deinit();
+
+    try testing.expect(!t_transposed.is_contiguous());
+    try testing.expectEqualSlices(usize, t_transposed.size, &.{ 2, 3 });
+
+    // Reshape to 3x2
+    var reshaped_t = try t_transposed.resize(&.{ 3, 2 });
+    defer reshaped_t.deinit();
+
+    const expected_data = [_]f32{ 1, 3, 5, 2, 4, 6 };
+    const expected_size = [_]usize{ 3, 2 };
+
+    try testing.expectEqualSlices(f32, &expected_data, reshaped_t.data);
+    try testing.expectEqualSlices(usize, &expected_size, reshaped_t.size);
+    try testing.expect(reshaped_t.is_contiguous());
 }
 
 test "add" {
@@ -604,20 +722,8 @@ test "mul transpose" {
     var b = try Tensor(f32).initFromSlice(&size_b, &data_b, allocator);
     defer b.deinit();
 
-    std.debug.print("b stride before: ", .{});
-    printSlice(usize, b.stride);
-    std.debug.print("\n", .{});
-
     var b_transpose = try b.transpose(0, 1);
     defer b_transpose.deinit();
-
-    std.debug.print("b data: ", .{});
-    printSlice(f32, b.data);
-    std.debug.print("\n", .{});
-
-    std.debug.print("b stride: ", .{});
-    printSlice(usize, b_transpose.stride);
-    std.debug.print("\n", .{});
 
     var c = try _matmul(f32, &a, &b_transpose);
     defer c.deinit();
@@ -691,47 +797,47 @@ test "backward (add) #2" {
     try testing.expectEqualSlices(f32, &expected_grad, a.gradient.?);
 }
 
-// test "backwards nested" {
-//     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-//     defer arena.deinit();
-//     const allocator = arena.allocator();
+test "backwards nested" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-//     const size = [_]usize{ 2, 2 };
+    const size = [_]usize{ 2, 2 };
 
-//     const data_in0 = [_]f32{ 1, 2, 3, 4 };
-//     var in0 = try Tensor(f32).initFromSlice(&size, &data_in0, allocator);
-//     defer in0.deinit();
+    const data_in0 = [_]f32{ 1, 2, 3, 4 };
+    var in0 = try Tensor(f32).initFromSlice(&size, &data_in0, allocator);
+    defer in0.deinit();
 
-//     const data_in1 = [_]f32{ 5, 6, 7, 8 };
-//     var in1 = try Tensor(f32).initFromSlice(&size, &data_in1, allocator);
-//     defer in1.deinit();
+    const data_in1 = [_]f32{ 5, 6, 7, 8 };
+    var in1 = try Tensor(f32).initFromSlice(&size, &data_in1, allocator);
+    defer in1.deinit();
 
-//     const data_in2 = [_]f32{ 9, 10, 11, 12 };
-//     var in2 = try Tensor(f32).initFromSlice(&size, &data_in2, allocator);
-//     defer in2.deinit();
+    const data_in2 = [_]f32{ 9, 10, 11, 12 };
+    var in2 = try Tensor(f32).initFromSlice(&size, &data_in2, allocator);
+    defer in2.deinit();
 
-//     const data_in3 = [_]f32{ 1, 2, 3, 4 };
-//     var in3 = try Tensor(f32).initFromSlice(&size, &data_in3, allocator);
-//     defer in3.deinit();
+    const data_in3 = [_]f32{ 1, 2, 3, 4 };
+    var in3 = try Tensor(f32).initFromSlice(&size, &data_in3, allocator);
+    defer in3.deinit();
 
-//     // Perform addition
-//     var out0 = try in0.mul_(&in1);
-//     defer out0.deinit();
-//     var out1 = try out0.add_(&in2);
-//     defer out1.deinit();
-//     var out2 = try out1.mul_(&in3);
-//     defer out2.deinit();
+    // Perform addition
+    var out0 = try in0.matmul(&in1);
+    defer out0.deinit();
+    var out1 = try out0.add(&in2);
+    defer out1.deinit();
+    var out2 = try out1.matmul(&in3);
+    defer out2.deinit();
 
-//     // Perform backward pass
-//     try backward(f32, &out2);
+    // Perform backward pass
+    try _backward(f32, &out2);
 
-//     // Expected gradients
-//     const ex0 = [_]f32{ 57, 77, 57, 77 };
-//     const ex1 = [_]f32{ 12, 28, 18, 42 };
-//     const ex2 = [_]f32{ 3, 7, 3, 7 };
-//     const ex3 = [_]f32{ 82, 82, 94, 94 };
+    // Expected gradients
+    const ex0 = [_]f32{ 57, 77, 57, 77 };
+    const ex1 = [_]f32{ 12, 28, 18, 42 };
+    const ex2 = [_]f32{ 3, 7, 3, 7 };
+    const ex3 = [_]f32{ 82, 82, 94, 94 };
 
-//     inline for (.{ in0, in1, in2, in3 }, .{ ex0, ex1, ex2, ex3 }) |in, gr| {
-//         try testing.expectEqualSlices(f32, in.gradient.?, &gr);
-//     }
-// }
+    inline for (.{ in0, in1, in2, in3 }, .{ ex0, ex1, ex2, ex3 }) |in, gr| {
+        try testing.expectEqualSlices(f32, in.gradient.?, &gr);
+    }
+}
