@@ -1,6 +1,9 @@
 const std = @import("std");
+const arc = @import("./arc.zig");
+
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
+const Arc = arc.Arc;
 
 // TODO: Consider the empty tensor
 // TODO: Add refcount
@@ -342,6 +345,266 @@ pub fn Tensor(comptime T: type) type {
     };
 }
 
+/// Tensor over generic T
+pub fn TensorArc(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        allocator: Allocator,
+
+        gradient: ?[]T,
+        comp_graph: ?*Graph(T),
+
+        data: Arc([]T),
+        size: []usize,
+        stride: []usize,
+
+        /// Builds stride from size
+        inline fn buildStride(size: []const usize, stride: []usize) void {
+            // `data` is organized so that values in the innermost layer is
+            // adjacent. With every layer on top, we have to multiply by the
+            // size of the layer.
+            // For example if the shape of the tensor is (3,4,5), this loop
+            // will set a stride (1,3,12).
+            var running_stride: usize = 1;
+            var i: usize = size.len;
+            while (i > 0) {
+                i -= 1;
+                stride[i] = running_stride;
+                running_stride *= size[i];
+            }
+        }
+
+        /// Initialize with owned data
+        pub fn initFromOwned(size: []usize, data: []T, allocator: Allocator) !Self {
+            var size_total: usize = 1;
+            for (size) |s| {
+                size_total *= s;
+            }
+            std.debug.assert(size_total == data.len);
+
+            const stride_heap = try allocator.alloc(usize, size.len);
+            buildStride(size, stride_heap);
+
+            const arc_data = Arc([]T).init(data, Self.deinit_data, allocator);
+
+            return Self{
+                .allocator = allocator,
+                .data = arc_data,
+                .size = size,
+                .stride = stride_heap,
+                .gradient = null,
+                .comp_graph = null,
+            };
+        }
+
+        /// Initialize with a slice
+        pub fn initFromSlice(size: []const usize, data: []const T, allocator: Allocator) !Tensor(T) {
+            var size_total: usize = 1;
+            for (size) |s| {
+                size_total *= s;
+            }
+            std.debug.assert(size_total == data.len);
+
+            const data_heap = try allocator.alloc(T, data.len);
+            @memcpy(data_heap, data);
+
+            const size_heap = try allocator.alloc(usize, size.len);
+            @memcpy(size_heap, size);
+
+            const stride_heap = try allocator.alloc(usize, size.len);
+            buildStride(size_heap, stride_heap);
+
+            return Self{
+                .allocator = allocator,
+                .data = data_heap,
+                .size = size_heap,
+                .stride = stride_heap,
+                .gradient = null,
+                .comp_graph = null,
+            };
+        }
+
+        pub fn clone(self: *const Self) !Tensor(T) {
+            const data_heap = try self.allocator.alloc(T, self.data.len);
+            @memcpy(data_heap, self.data);
+
+            const size_heap = try self.allocator.alloc(usize, self.size.len);
+            @memcpy(size_heap, self.size);
+
+            const stride_heap = try self.allocator.alloc(usize, self.stride.len);
+            @memcpy(stride_heap, self.stride);
+
+            return Self{
+                .allocator = self.allocator,
+                .data = data_heap,
+                .size = size_heap,
+                .stride = stride_heap,
+                .gradient = null,
+                .comp_graph = null,
+            };
+        }
+
+        pub fn ones(size: []const usize, allocator: Allocator) !Tensor(T) {
+            var num_elements: usize = 1;
+            for (size) |s| num_elements *= s;
+
+            const data_heap = try allocator.alloc(T, num_elements);
+            for (0..num_elements) |i| {
+                data_heap[i] = 1;
+            }
+
+            const size_heap = try allocator.alloc(usize, size.len);
+            @memcpy(size_heap, size);
+
+            const stride_heap = try allocator.alloc(usize, size.len);
+            buildStride(size_heap, stride_heap);
+
+            return Self{
+                .allocator = allocator,
+                .data = data_heap,
+                .size = size_heap,
+                .stride = stride_heap,
+                .gradient = null,
+                .comp_graph = null,
+            };
+        }
+
+        pub fn deinit_data(data: []T, allocator: Allocator) void {
+            allocator.free(data);
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.allocator.free(self.size);
+            self.allocator.free(self.stride);
+            if (self.comp_graph) |cg| cg.deinit();
+            if (self.gradient) |grad| self.allocator.free(grad);
+            self.data.unref();
+        }
+
+        pub fn transpose(
+            self: *const Self,
+            dim0: usize,
+            dim1: usize,
+        ) !Tensor(T) {
+            if (dim0 >= self.size.len or dim1 >= self.size.len) {
+                return error.InvalidDimensions;
+            }
+
+            // TODO: Copying data here makes everything pointless, but currently
+            // there's no mechanism to refcount.
+            const new_data = try self.allocator.alloc(T, self.data.len);
+            @memcpy(new_data, self.data);
+
+            var new_size = try self.allocator.alloc(usize, self.size.len);
+            var new_stride = try self.allocator.alloc(usize, self.stride.len);
+
+            // Copy the original sizes and strides into the new ones
+            for (self.size, 0..) |size, i| {
+                new_size[i] = size;
+            }
+            for (self.stride, 0..) |stride, i| {
+                new_stride[i] = stride;
+            }
+
+            // Swap the dimensions
+            std.mem.swap(usize, &new_size[dim0], &new_size[dim1]);
+            std.mem.swap(usize, &new_stride[dim0], &new_stride[dim1]);
+
+            return Tensor(T){
+                .allocator = self.allocator,
+                .gradient = null,
+                .comp_graph = null,
+                .data = new_data,
+                .size = new_size,
+                .stride = new_stride,
+            };
+        }
+
+        pub fn is_contiguous(self: *const Self) bool {
+            const stride_len = self.stride.len;
+            if (stride_len == 1) return true;
+
+            for (0..(self.stride.len - 1)) |i| {
+                if (self.stride[i] < self.stride[i + 1]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        pub fn contiguous(self: *Self) !void {
+            var data = try self.allocator.alloc(T, self.data.len);
+            var it = Iterator(T).fromTensor(self);
+
+            var next = it.next();
+            while (next != null) : (next = it.next()) {
+                data[it.index - 1] = next.?;
+            }
+
+            // Replace data with contiguous one
+            self.allocator.free(self.data);
+            self.data = data;
+
+            // Build stride from scratch, as it might be invalidated
+            buildStride(self.size, self.stride);
+        }
+
+        // Returns total number of items
+        pub fn numel(self: *Self) usize {
+            var n: usize = 1;
+            for (self.size) |s| n *= s;
+            return n;
+        }
+
+        fn is_reshape_valid(old: []const usize, new: []const usize) bool {
+            var old_size: usize = 1;
+            for (old) |o| old_size *= o;
+
+            var new_size: usize = 1;
+            for (new) |n| new_size *= n;
+
+            return old_size == new_size;
+        }
+
+        pub fn resize(self: *Self, new_size: []const usize) !Self {
+            if (!is_reshape_valid(self.size, new_size)) {
+                return error.IncompatibleSize;
+            }
+            var tensor = try self.clone();
+            if (!tensor.is_contiguous()) try tensor.contiguous();
+
+            @memcpy(tensor.size, new_size);
+            buildStride(tensor.size, tensor.stride);
+            return tensor;
+        }
+
+        /// Print data
+        pub fn print(self: *Self) void {
+            var it = Iterator(T).fromTensor(self);
+            var next = it.next();
+            while (next != null) : (next = it.next()) {
+                std.debug.print("{} ", .{next.?});
+            }
+            std.debug.print("\n", .{});
+        }
+
+        // Convenience functions
+
+        pub fn add(self: *Self, other: *Self) !Self {
+            return _add(T, self, other);
+        }
+
+        pub fn matmul(self: *Self, other: *Self) !Self {
+            return _matmul(T, self, other);
+        }
+
+        pub fn backward(self: *Self) !void {
+            try _backward(T, self);
+        }
+    };
+}
+
 pub fn _add(comptime T: type, a: *Tensor(T), b: *Tensor(T)) !Tensor(T) {
     const same_size = for (a.size, b.size) |ad, bd| {
         if (ad != bd) break false;
@@ -500,12 +763,13 @@ test "Tensor::initFromOwned" {
     const size = try allocator.alloc(usize, 2);
     @memcpy(size, &[_]usize{ 2, 3 });
 
-    var t = try Tensor(f32).initFromOwned(size, data, allocator);
+    var t = try TensorArc(f32).initFromOwned(size, data, allocator);
     defer t.deinit();
 
     try testing.expectEqual(@as(usize, 2), t.size[0]);
     try testing.expectEqual(@as(usize, 3), t.size[1]);
-    try testing.expectEqualSlices(f32, data, t.data);
+    try testing.expectEqualSlices(f32, data, t.data.ref());
+    defer t.data.unref();
 }
 
 test "Tensor::initFromSlice" {
