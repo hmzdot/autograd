@@ -9,11 +9,10 @@ in Zig.
 - [x] `Tensor` struct
 - [x] `Tensor` creation
 - [x] `Tensor` addition
-- [ ] `Tensor` subtraction
 - [x] `Tensor` multiplication
 - [ ] Broadcasting
 
 ### Autograd
 - [x] Computation graph
 - [x] Backpropagation for addition
-- [ ] Backpropagation for multiplication
+- [x] Backpropagation for multiplication
