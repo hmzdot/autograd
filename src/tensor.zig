@@ -3,10 +3,7 @@ const arc = @import("./arc.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const ArcArray = arc.ArcArray;
-
-// TODO: Consider the empty tensor
-// TODO: Add refcount
+const Storage = arc.ArcArray;
 
 const Op = enum { add, mul, none };
 
@@ -22,61 +19,17 @@ fn printSlice(comptime T: type, slice: []const T) void {
 }
 
 // Tensor iterator that respects stride
-fn Iterator(comptime T: type) type {
-    return struct {
-        const Self = @This();
-
-        data: []T,
-        stride: []const usize,
-        size: []const usize,
-        index: usize,
-        total: usize,
-
-        pub fn fromTensor(tensor: *const Tensor(T)) Self {
-            var total: usize = 1;
-            for (tensor.size) |s| total *= s;
-
-            return Iterator(T){
-                .data = tensor.data,
-                .stride = tensor.stride,
-                .size = tensor.size,
-                .index = 0,
-                .total = total,
-            };
-        }
-
-        pub fn next(self: *Self) ?T {
-            if (self.index >= self.total) {
-                return null;
-            } else {
-                var offset: usize = 0;
-                var rem_index = self.index;
-                var dim_index = self.size.len;
-                while (dim_index > 0) : (dim_index -= 1) {
-                    const st = self.stride[dim_index - 1];
-                    const sz = self.size[dim_index - 1];
-                    offset += (rem_index % sz) * st;
-                    rem_index /= sz;
-                }
-                self.index += 1;
-                return self.data[offset];
-            }
-        }
-    };
-}
-
-// Tensor iterator that respects stride
 fn IteratorArc(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        data: *ArcArray(T),
+        data: *Storage(T),
         stride: []const usize,
         size: []const usize,
         index: usize,
         total: usize,
 
-        pub fn init(tensor: *TensorArc(T)) Self {
+        pub fn init(tensor: *Tensor(T)) Self {
             var total: usize = 1;
             for (tensor.size) |s| total *= s;
 
@@ -114,7 +67,7 @@ fn IteratorArc(comptime T: type) type {
     };
 }
 
-fn Graph(comptime T: type) type {
+fn GraphArc(comptime T: type) type {
     return struct {
         const Self = @This();
 
@@ -122,7 +75,7 @@ fn Graph(comptime T: type) type {
         operation: Op,
         operands: ?[]*Tensor(T),
 
-        pub fn init(op: Op, operands: []const *Tensor(T), allocator: Allocator) !Graph(T) {
+        pub fn init(op: Op, operands: []const *Tensor(T), allocator: Allocator) !Self {
             const operands_heap = try allocator.alloc(*Tensor(T), operands.len);
             @memcpy(operands_heap, operands[0..]);
 
@@ -148,263 +101,9 @@ pub fn Tensor(comptime T: type) type {
         allocator: Allocator,
 
         gradient: ?[]T,
-        comp_graph: ?*Graph(T),
+        comp_graph: ?*GraphArc(T),
 
-        data: []T,
-        size: []usize,
-        stride: []usize,
-
-        /// Builds stride from size
-        inline fn buildStride(size: []const usize, stride: []usize) void {
-            // `data` is organized so that values in the innermost layer is
-            // adjacent. With every layer on top, we have to multiply by the
-            // size of the layer.
-            // For example if the shape of the tensor is (3,4,5), this loop
-            // will set a stride (1,3,12).
-            var running_stride: usize = 1;
-            var i: usize = size.len;
-            while (i > 0) {
-                i -= 1;
-                stride[i] = running_stride;
-                running_stride *= size[i];
-            }
-        }
-
-        /// Initialize with owned data
-        pub fn initFromOwned(size: []usize, data: []T, allocator: Allocator) !Tensor(T) {
-            var size_total: usize = 1;
-            for (size) |s| {
-                size_total *= s;
-            }
-            std.debug.assert(size_total == data.len);
-
-            const stride_heap = try allocator.alloc(usize, size.len);
-            buildStride(size, stride_heap);
-
-            return Self{
-                .allocator = allocator,
-                .data = data,
-                .size = size,
-                .stride = stride_heap,
-                .gradient = null,
-                .comp_graph = null,
-            };
-        }
-
-        /// Initialize with a slice
-        pub fn initFromSlice(size: []const usize, data: []const T, allocator: Allocator) !Tensor(T) {
-            var size_total: usize = 1;
-            for (size) |s| {
-                size_total *= s;
-            }
-            std.debug.assert(size_total == data.len);
-
-            const data_heap = try allocator.alloc(T, data.len);
-            @memcpy(data_heap, data);
-
-            const size_heap = try allocator.alloc(usize, size.len);
-            @memcpy(size_heap, size);
-
-            const stride_heap = try allocator.alloc(usize, size.len);
-            buildStride(size_heap, stride_heap);
-
-            return Self{
-                .allocator = allocator,
-                .data = data_heap,
-                .size = size_heap,
-                .stride = stride_heap,
-                .gradient = null,
-                .comp_graph = null,
-            };
-        }
-
-        pub fn clone(self: *const Self) !Tensor(T) {
-            const data_heap = try self.allocator.alloc(T, self.data.len);
-            @memcpy(data_heap, self.data);
-
-            const size_heap = try self.allocator.alloc(usize, self.size.len);
-            @memcpy(size_heap, self.size);
-
-            const stride_heap = try self.allocator.alloc(usize, self.stride.len);
-            @memcpy(stride_heap, self.stride);
-
-            return Self{
-                .allocator = self.allocator,
-                .data = data_heap,
-                .size = size_heap,
-                .stride = stride_heap,
-                .gradient = null,
-                .comp_graph = null,
-            };
-        }
-
-        pub fn ones(size: []const usize, allocator: Allocator) !Tensor(T) {
-            var num_elements: usize = 1;
-            for (size) |s| num_elements *= s;
-
-            const data_heap = try allocator.alloc(T, num_elements);
-            for (0..num_elements) |i| {
-                data_heap[i] = 1;
-            }
-
-            const size_heap = try allocator.alloc(usize, size.len);
-            @memcpy(size_heap, size);
-
-            const stride_heap = try allocator.alloc(usize, size.len);
-            buildStride(size_heap, stride_heap);
-
-            return Self{
-                .allocator = allocator,
-                .data = data_heap,
-                .size = size_heap,
-                .stride = stride_heap,
-                .gradient = null,
-                .comp_graph = null,
-            };
-        }
-
-        pub fn deinit(self: *Self) void {
-            self.allocator.free(self.data);
-            self.allocator.free(self.size);
-            self.allocator.free(self.stride);
-            if (self.comp_graph) |cg| cg.deinit();
-            if (self.gradient) |grad| self.allocator.free(grad);
-        }
-
-        pub fn transpose(
-            self: *const Self,
-            dim0: usize,
-            dim1: usize,
-        ) !Tensor(T) {
-            if (dim0 >= self.size.len or dim1 >= self.size.len) {
-                return error.InvalidDimensions;
-            }
-
-            // TODO: Copying data here makes everything pointless, but currently
-            // there's no mechanism to refcount.
-            const new_data = try self.allocator.alloc(T, self.data.len);
-            @memcpy(new_data, self.data);
-
-            var new_size = try self.allocator.alloc(usize, self.size.len);
-            var new_stride = try self.allocator.alloc(usize, self.stride.len);
-
-            // Copy the original sizes and strides into the new ones
-            for (self.size, 0..) |size, i| {
-                new_size[i] = size;
-            }
-            for (self.stride, 0..) |stride, i| {
-                new_stride[i] = stride;
-            }
-
-            // Swap the dimensions
-            std.mem.swap(usize, &new_size[dim0], &new_size[dim1]);
-            std.mem.swap(usize, &new_stride[dim0], &new_stride[dim1]);
-
-            return Tensor(T){
-                .allocator = self.allocator,
-                .gradient = null,
-                .comp_graph = null,
-                .data = new_data,
-                .size = new_size,
-                .stride = new_stride,
-            };
-        }
-
-        pub fn is_contiguous(self: *const Self) bool {
-            const stride_len = self.stride.len;
-            if (stride_len == 1) return true;
-
-            for (0..(self.stride.len - 1)) |i| {
-                if (self.stride[i] < self.stride[i + 1]) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        pub fn contiguous(self: *Self) !void {
-            var data = try self.allocator.alloc(T, self.data.len);
-            var it = Iterator(T).fromTensor(self);
-
-            var next = it.next();
-            while (next != null) : (next = it.next()) {
-                data[it.index - 1] = next.?;
-            }
-
-            // Replace data with contiguous one
-            self.allocator.free(self.data);
-            self.data = data;
-
-            // Build stride from scratch, as it might be invalidated
-            buildStride(self.size, self.stride);
-        }
-
-        // Returns total number of items
-        pub fn numel(self: *Self) usize {
-            var n: usize = 1;
-            for (self.size) |s| n *= s;
-            return n;
-        }
-
-        fn is_reshape_valid(old: []const usize, new: []const usize) bool {
-            var old_size: usize = 1;
-            for (old) |o| old_size *= o;
-
-            var new_size: usize = 1;
-            for (new) |n| new_size *= n;
-
-            return old_size == new_size;
-        }
-
-        pub fn resize(self: *Self, new_size: []const usize) !Self {
-            if (!is_reshape_valid(self.size, new_size)) {
-                return error.IncompatibleSize;
-            }
-            var tensor = try self.clone();
-            if (!tensor.is_contiguous()) try tensor.contiguous();
-
-            @memcpy(tensor.size, new_size);
-            buildStride(tensor.size, tensor.stride);
-            return tensor;
-        }
-
-        /// Print data
-        pub fn print(self: *Self) void {
-            var it = Iterator(T).fromTensor(self);
-            var next = it.next();
-            while (next != null) : (next = it.next()) {
-                std.debug.print("{} ", .{next.?});
-            }
-            std.debug.print("\n", .{});
-        }
-
-        // Convenience functions
-
-        pub fn add(self: *Self, other: *Self) !Self {
-            return _add(T, self, other);
-        }
-
-        pub fn matmul(self: *Self, other: *Self) !Self {
-            return _matmul(T, self, other);
-        }
-
-        pub fn backward(self: *Self) !void {
-            try _backward(T, self);
-        }
-    };
-}
-
-/// Tensor over generic T
-pub fn TensorArc(comptime T: type) type {
-    return struct {
-        const Self = @This();
-
-        allocator: Allocator,
-
-        gradient: ?[]T,
-        comp_graph: ?*Graph(T),
-
-        data: *ArcArray(T),
+        data: *Storage(T),
         size: []usize,
         stride: []usize,
 
@@ -435,8 +134,8 @@ pub fn TensorArc(comptime T: type) type {
             const stride_heap = try allocator.alloc(usize, size.len);
             buildStride(size, stride_heap);
 
-            const arc_data: *ArcArray(T) = try allocator.create(ArcArray(T));
-            arc_data.* = ArcArray(T).init(data, allocator);
+            const arc_data: *Storage(T) = try allocator.create(Storage(T));
+            arc_data.* = Storage(T).init(data, allocator);
 
             return Self{
                 .allocator = allocator,
@@ -458,15 +157,14 @@ pub fn TensorArc(comptime T: type) type {
 
             const data_heap = try allocator.alloc(T, data.len);
             @memcpy(data_heap, data);
+            const arc_data = try allocator.create(Storage(T));
+            arc_data.* = Storage(T).init(data_heap, allocator);
 
             const size_heap = try allocator.alloc(usize, size.len);
             @memcpy(size_heap, size);
 
             const stride_heap = try allocator.alloc(usize, size.len);
             buildStride(size_heap, stride_heap);
-
-            const arc_data = try allocator.create(ArcArray(T));
-            arc_data.* = ArcArray(T).init(data_heap, allocator);
 
             return Self{
                 .allocator = allocator,
@@ -480,9 +178,9 @@ pub fn TensorArc(comptime T: type) type {
 
         pub fn clone(self: *const Self) !Self {
             const data_heap = try self.allocator.alloc(T, self.data.raw.len);
-            @memcpy(data_heap, self.data.raw.*);
-            const arc_data = try self.allocator.create(ArcArray(T));
-            arc_data.* = ArcArray(T).init(data_heap, self.allocator);
+            @memcpy(data_heap, self.data.raw);
+            const arc_data = try self.allocator.create(Storage(T));
+            arc_data.* = Storage(T).init(data_heap, self.allocator);
 
             const size_heap = try self.allocator.alloc(usize, self.size.len);
             @memcpy(size_heap, self.size);
@@ -508,8 +206,8 @@ pub fn TensorArc(comptime T: type) type {
             for (0..num_elements) |i| {
                 data_heap[i] = 1;
             }
-            const arc_data = try allocator.create(ArcArray(T));
-            arc_data.* = ArcArray(T).init(data_heap, allocator);
+            const arc_data = try allocator.create(Storage(T));
+            arc_data.* = Storage(T).init(data_heap, allocator);
 
             const size_heap = try allocator.alloc(usize, size.len);
             @memcpy(size_heap, size);
@@ -591,8 +289,8 @@ pub fn TensorArc(comptime T: type) type {
 
             // Replace data with contiguous one
             self.data.unref();
-            self.data = try self.allocator.create(ArcArray(T));
-            self.data.* = ArcArray(T).init(data, self.allocator);
+            self.data = try self.allocator.create(Storage(T));
+            self.data.* = Storage(T).init(data, self.allocator);
 
             // Build stride from scratch, as it might be invalidated
             buildStride(self.size, self.stride);
@@ -605,7 +303,7 @@ pub fn TensorArc(comptime T: type) type {
             return n;
         }
 
-        fn is_reshape_valid(old: []const usize, new: []const usize) bool {
+        fn is_resize_valid(old: []const usize, new: []const usize) bool {
             var old_size: usize = 1;
             for (old) |o| old_size *= o;
 
@@ -616,7 +314,7 @@ pub fn TensorArc(comptime T: type) type {
         }
 
         pub fn resize(self: *Self, new_size: []const usize) !Self {
-            if (!is_reshape_valid(self.size, new_size)) {
+            if (!is_resize_valid(self.size, new_size)) {
                 return error.IncompatibleSize;
             }
             var tensor = try self.clone();
@@ -629,7 +327,7 @@ pub fn TensorArc(comptime T: type) type {
 
         /// Print data
         pub fn print(self: *Self) void {
-            var it = Iterator(T).fromTensor(self);
+            var it = IteratorArc(T).init(self);
             var next = it.next();
             while (next != null) : (next = it.next()) {
                 std.debug.print("{} ", .{next.?});
@@ -662,9 +360,9 @@ pub fn _add(comptime T: type, a: *Tensor(T), b: *Tensor(T)) !Tensor(T) {
     const size: []usize = try a.allocator.alloc(usize, a.size.len);
     @memcpy(size, a.size);
 
-    var data: []T = try a.allocator.alloc(T, a.data.len);
-    var a_it = Iterator(T).fromTensor(a);
-    var b_it = Iterator(T).fromTensor(b);
+    var data: []T = try a.allocator.alloc(T, a.data.raw.len);
+    var a_it = IteratorArc(T).init(a);
+    var b_it = IteratorArc(T).init(b);
     while (true) {
         const a_next = a_it.next() orelse break;
         const b_next = b_it.next() orelse break;
@@ -672,8 +370,8 @@ pub fn _add(comptime T: type, a: *Tensor(T), b: *Tensor(T)) !Tensor(T) {
     }
 
     var t = try Tensor(T).initFromOwned(size, data, a.allocator);
-    t.comp_graph = try a.allocator.create(Graph(T));
-    t.comp_graph.?.* = try Graph(T).init(Op.add, &.{ a, b }, a.allocator);
+    t.comp_graph = try a.allocator.create(GraphArc(T));
+    t.comp_graph.?.* = try GraphArc(T).init(Op.add, &.{ a, b }, a.allocator);
     return t;
 }
 
@@ -701,7 +399,10 @@ pub fn _matmul(comptime T: type, a: *Tensor(T), b: *Tensor(T)) !Tensor(T) {
 
             var sum: T = 0;
             for (0..shared_dim) |vi| {
-                sum += a_2d.data[a_offset + vi * a_2d.stride[1]] * b_2d.data[b_offset + vi * b_2d.stride[0]];
+                // It's safe to access `.raw` data as both tensors are owned
+                // by the function and will be dropped at the end
+                sum += a_2d.data.raw[a_offset + vi * a_2d.stride[1]] *
+                    b_2d.data.raw[b_offset + vi * b_2d.stride[0]];
             }
             c_data[ad * b_dim + bd] = sum;
         }
@@ -712,16 +413,16 @@ pub fn _matmul(comptime T: type, a: *Tensor(T), b: *Tensor(T)) !Tensor(T) {
     @memcpy(size[a_end..], b.size[1..]);
 
     var t = try Tensor(T).initFromOwned(size, c_data, a.allocator);
-    t.comp_graph = try a.allocator.create(Graph(T));
-    t.comp_graph.?.* = try Graph(T).init(Op.mul, &.{ a, b }, a.allocator);
+    t.comp_graph = try a.allocator.create(GraphArc(T));
+    t.comp_graph.?.* = try GraphArc(T).init(Op.mul, &.{ a, b }, a.allocator);
     return t;
 }
 
 pub fn _backward(comptime T: type, t: *Tensor(T)) !void {
     if (t.gradient == null) {
-        t.gradient = try t.allocator.alloc(T, t.data.len);
+        t.gradient = try t.allocator.alloc(T, t.data.raw.len);
         var i: usize = 0;
-        while (i < t.data.len) : (i += 1) {
+        while (i < t.data.raw.len) : (i += 1) {
             t.gradient.?[i] = 1;
         }
     }
@@ -731,13 +432,13 @@ pub fn _backward(comptime T: type, t: *Tensor(T)) !void {
             .add => {
                 const op0 = cg.operands.?[0]; // left operand
                 if (op0.gradient == null) {
-                    op0.gradient = try op0.allocator.alloc(T, op0.data.len);
+                    op0.gradient = try op0.allocator.alloc(T, op0.data.raw.len);
                     @memset(op0.gradient.?, 0);
                 }
 
                 const op1 = cg.operands.?[1]; // right operand
                 if (op1.gradient == null) {
-                    op1.gradient = try op1.allocator.alloc(T, op1.data.len);
+                    op1.gradient = try op1.allocator.alloc(T, op1.data.raw.len);
                     @memset(op1.gradient.?, 0);
                 }
 
@@ -745,7 +446,7 @@ pub fn _backward(comptime T: type, t: *Tensor(T)) !void {
                 const grad0 = op0.gradient.?;
                 const grad1 = op1.gradient.?;
                 var i: usize = 0;
-                while (i < t.data.len) : (i += 1) {
+                while (i < t.data.raw.len) : (i += 1) {
                     grad0[i] += t.gradient.?[i];
                     grad1[i] += t.gradient.?[i];
                 }
@@ -756,13 +457,13 @@ pub fn _backward(comptime T: type, t: *Tensor(T)) !void {
             .mul => {
                 const op0 = cg.operands.?[0]; // left operand
                 if (op0.gradient == null) {
-                    op0.gradient = try op0.allocator.alloc(T, op0.data.len);
+                    op0.gradient = try op0.allocator.alloc(T, op0.data.raw.len);
                     @memset(op0.gradient.?, 0);
                 }
 
                 const op1 = cg.operands.?[1]; // right operand
                 if (op1.gradient == null) {
-                    op1.gradient = try op1.allocator.alloc(T, op1.data.len);
+                    op1.gradient = try op1.allocator.alloc(T, op1.data.raw.len);
                     @memset(op1.gradient.?, 0);
                 }
 
@@ -781,12 +482,14 @@ pub fn _backward(comptime T: type, t: *Tensor(T)) !void {
                 var grad1_result = try transposed_op0.matmul(&grad_in);
 
                 // accumulate gradients
-                for (op0.gradient.?, grad0_result.data) |*grad, data| {
+                for (op0.gradient.?, grad0_result.data.ref()) |*grad, data| {
                     grad.* += data;
                 }
-                for (op1.gradient.?, grad1_result.data) |*grad, data| {
+                grad0_result.data.unref();
+                for (op1.gradient.?, grad1_result.data.ref()) |*grad, data| {
                     grad.* += data;
                 }
+                grad1_result.data.unref();
 
                 // clean up temporary tensors
                 grad0_result.deinit();
@@ -811,7 +514,7 @@ test "Tensor::initFromOwned" {
     const size = try allocator.alloc(usize, 2);
     @memcpy(size, &[_]usize{ 2, 3 });
 
-    var t = try TensorArc(f32).initFromOwned(size, data, allocator);
+    var t = try Tensor(f32).initFromOwned(size, data, allocator);
     defer t.deinit();
 
     try testing.expectEqual(@as(usize, 2), t.size[0]);
@@ -825,7 +528,7 @@ test "Tensor::initFromSlice" {
     const data = [_]f32{ 0, 1, 2, 3, 4, 5 };
     const size = [_]usize{ 2, 3 };
 
-    var t = try TensorArc(f32).initFromSlice(&size, &data, allocator);
+    var t = try Tensor(f32).initFromSlice(&size, &data, allocator);
     defer t.deinit();
 
     try testing.expectEqual(@as(usize, 2), t.size[0]);
@@ -838,7 +541,7 @@ test "Tensor::ones" {
     const allocator = testing.allocator;
     const size = [_]usize{ 2, 3 };
 
-    var t = try TensorArc(f32).ones(&size, allocator);
+    var t = try Tensor(f32).ones(&size, allocator);
     defer t.deinit();
 
     const expected = [_]f32{ 1, 1, 1, 1, 1, 1 };
@@ -853,7 +556,7 @@ test "Tensor::transpose" {
     const data = [_]f32{ 1, 2, 3, 4, 5, 6 };
     const size = [_]usize{ 2, 3 };
 
-    var t = try TensorArc(f32).initFromSlice(&size, &data, allocator);
+    var t = try Tensor(f32).initFromSlice(&size, &data, allocator);
     defer t.deinit();
 
     var t_transposed = try t.transpose(0, 1);
@@ -907,7 +610,7 @@ test "Tensor::contiguous" {
     const expected_data = [_]f32{ 1, 4, 2, 5, 3, 6 };
     const expected_size = [_]usize{ 3, 2 };
 
-    try testing.expectEqualSlices(f32, &expected_data, t_transposed.data);
+    try testing.expectEqualSlices(f32, &expected_data, t_transposed.data.raw);
     try testing.expectEqualSlices(usize, &expected_size, t_transposed.size);
 }
 
@@ -927,7 +630,7 @@ test "Tensor::reshape" {
     const expected_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
     const expected_size = [_]usize{ 3, 2 };
 
-    try testing.expectEqualSlices(f32, &expected_data, reshaped_t.data);
+    try testing.expectEqualSlices(f32, &expected_data, reshaped_t.data.raw);
     try testing.expectEqualSlices(usize, &expected_size, reshaped_t.size);
 }
 
@@ -948,12 +651,19 @@ test "Tensor::reshape non-contiguous" {
     var reshaped_t = try t_transposed.resize(&.{ 3, 2 });
     defer reshaped_t.deinit();
 
+    try testing.expectEqual(t_transposed.data.count.load(.monotonic), 2);
+    std.debug.print("t: Count after reshape {}\n", .{t.data.count});
+    std.debug.print("tt: Count after reshape {}\n", .{t_transposed.data.count});
+    std.debug.print("rs: Count after reshape {}\n", .{reshaped_t.data.count});
+
     const expected_data = [_]f32{ 1, 3, 5, 2, 4, 6 };
     const expected_size = [_]usize{ 3, 2 };
 
-    try testing.expectEqualSlices(f32, &expected_data, reshaped_t.data);
+    try testing.expectEqualSlices(f32, &expected_data, reshaped_t.data.raw);
     try testing.expectEqualSlices(usize, &expected_size, reshaped_t.size);
     try testing.expect(reshaped_t.is_contiguous());
+
+    std.debug.print("clean \n", .{});
 }
 
 test "add" {
@@ -971,7 +681,7 @@ test "add" {
     defer c.deinit();
 
     const expected = [_]f32{ 6, 8, 10, 12 };
-    try testing.expectEqualSlices(f32, &expected, c.data);
+    try testing.expectEqualSlices(f32, &expected, c.data.raw);
 
     // Check computation graph
     try testing.expect(c.comp_graph != null);
@@ -1011,7 +721,7 @@ test "mul" {
     try testing.expectEqual(@as(usize, 2), c.size[1]);
 
     // Check values
-    try testing.expectEqualSlices(f32, &expected, c.data);
+    try testing.expectEqualSlices(f32, &expected, c.data.raw);
 
     // Check computation graph
     try testing.expect(c.comp_graph != null);
@@ -1052,7 +762,7 @@ test "mul transpose" {
     try testing.expectEqual(@as(usize, 2), c.size[1]);
 
     // Check values
-    try testing.expectEqualSlices(f32, &expected, c.data);
+    try testing.expectEqualSlices(f32, &expected, c.data.raw);
 
     // Check computation graph
     try testing.expect(c.comp_graph != null);
