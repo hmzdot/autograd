@@ -19,11 +19,11 @@ fn printSlice(comptime T: type, slice: []const T) void {
 }
 
 // Tensor iterator that respects stride
-fn IteratorArc(comptime T: type) type {
+fn Iterator(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        data: *Storage(T),
+        data: Storage(T),
         stride: []const usize,
         size: []const usize,
         index: usize,
@@ -33,9 +33,8 @@ fn IteratorArc(comptime T: type) type {
             var total: usize = 1;
             for (tensor.size) |s| total *= s;
 
-            _ = tensor.data.ref();
             return Self{
-                .data = tensor.data,
+                .data = tensor.data.clone(),
                 .stride = tensor.stride,
                 .size = tensor.size,
                 .index = 0,
@@ -67,7 +66,7 @@ fn IteratorArc(comptime T: type) type {
     };
 }
 
-fn GraphArc(comptime T: type) type {
+fn Graph(comptime T: type) type {
     return struct {
         const Self = @This();
 
@@ -101,9 +100,9 @@ pub fn Tensor(comptime T: type) type {
         allocator: Allocator,
 
         gradient: ?[]T,
-        comp_graph: ?*GraphArc(T),
+        comp_graph: ?*Graph(T),
 
-        data: *Storage(T),
+        data: Storage(T),
         size: []usize,
         stride: []usize,
 
@@ -134,12 +133,9 @@ pub fn Tensor(comptime T: type) type {
             const stride_heap = try allocator.alloc(usize, size.len);
             buildStride(size, stride_heap);
 
-            const arc_data: *Storage(T) = try allocator.create(Storage(T));
-            arc_data.* = Storage(T).init(data, allocator);
-
             return Self{
                 .allocator = allocator,
-                .data = arc_data,
+                .data = try Storage(T).init(data, allocator),
                 .size = size,
                 .stride = stride_heap,
                 .gradient = null,
@@ -157,8 +153,6 @@ pub fn Tensor(comptime T: type) type {
 
             const data_heap = try allocator.alloc(T, data.len);
             @memcpy(data_heap, data);
-            const arc_data = try allocator.create(Storage(T));
-            arc_data.* = Storage(T).init(data_heap, allocator);
 
             const size_heap = try allocator.alloc(usize, size.len);
             @memcpy(size_heap, size);
@@ -168,7 +162,7 @@ pub fn Tensor(comptime T: type) type {
 
             return Self{
                 .allocator = allocator,
-                .data = arc_data,
+                .data = try Storage(T).init(data_heap, allocator),
                 .size = size_heap,
                 .stride = stride_heap,
                 .gradient = null,
@@ -179,8 +173,6 @@ pub fn Tensor(comptime T: type) type {
         pub fn clone(self: *const Self) !Self {
             const data_heap = try self.allocator.alloc(T, self.data.raw.len);
             @memcpy(data_heap, self.data.raw);
-            const arc_data = try self.allocator.create(Storage(T));
-            arc_data.* = Storage(T).init(data_heap, self.allocator);
 
             const size_heap = try self.allocator.alloc(usize, self.size.len);
             @memcpy(size_heap, self.size);
@@ -190,7 +182,7 @@ pub fn Tensor(comptime T: type) type {
 
             return Self{
                 .allocator = self.allocator,
-                .data = arc_data,
+                .data = try Storage(T).init(data_heap, self.allocator),
                 .size = size_heap,
                 .stride = stride_heap,
                 .gradient = null,
@@ -206,8 +198,6 @@ pub fn Tensor(comptime T: type) type {
             for (0..num_elements) |i| {
                 data_heap[i] = 1;
             }
-            const arc_data = try allocator.create(Storage(T));
-            arc_data.* = Storage(T).init(data_heap, allocator);
 
             const size_heap = try allocator.alloc(usize, size.len);
             @memcpy(size_heap, size);
@@ -217,7 +207,7 @@ pub fn Tensor(comptime T: type) type {
 
             return Self{
                 .allocator = allocator,
-                .data = arc_data,
+                .data = try Storage(T).init(data_heap, allocator),
                 .size = size_heap,
                 .stride = stride_heap,
                 .gradient = null,
@@ -231,7 +221,6 @@ pub fn Tensor(comptime T: type) type {
             if (self.comp_graph) |cg| cg.deinit();
             if (self.gradient) |grad| self.allocator.free(grad);
             self.data.unref();
-            self.allocator.destroy(self.data);
         }
 
         pub fn transpose(self: *Self, dim0: usize, dim1: usize) !Self {
@@ -239,7 +228,6 @@ pub fn Tensor(comptime T: type) type {
                 return error.InvalidDimensions;
             }
 
-            _ = self.data.ref();
             var new_size = try self.allocator.alloc(usize, self.size.len);
             var new_stride = try self.allocator.alloc(usize, self.stride.len);
 
@@ -259,7 +247,7 @@ pub fn Tensor(comptime T: type) type {
                 .allocator = self.allocator,
                 .gradient = null,
                 .comp_graph = null,
-                .data = self.data,
+                .data = self.data.clone(),
                 .size = new_size,
                 .stride = new_stride,
             };
@@ -279,7 +267,7 @@ pub fn Tensor(comptime T: type) type {
 
         pub fn contiguous(self: *Self) !void {
             var data = try self.allocator.alloc(T, self.data.raw.len);
-            var it = IteratorArc(T).init(self);
+            var it = Iterator(T).init(self);
             defer it.deinit();
 
             var next = it.next();
@@ -288,9 +276,8 @@ pub fn Tensor(comptime T: type) type {
             }
 
             // Replace data with contiguous one
-            self.data.unref();
-            self.data = try self.allocator.create(Storage(T));
-            self.data.* = Storage(T).init(data, self.allocator);
+            self.data.deinit();
+            self.data = try Storage(T).init(data, self.allocator);
 
             // Build stride from scratch, as it might be invalidated
             buildStride(self.size, self.stride);
@@ -327,7 +314,8 @@ pub fn Tensor(comptime T: type) type {
 
         /// Print data
         pub fn print(self: *Self) void {
-            var it = IteratorArc(T).init(self);
+            var it = Iterator(T).init(self);
+            defer it.deinit();
             var next = it.next();
             while (next != null) : (next = it.next()) {
                 std.debug.print("{} ", .{next.?});
@@ -361,17 +349,19 @@ pub fn _add(comptime T: type, a: *Tensor(T), b: *Tensor(T)) !Tensor(T) {
     @memcpy(size, a.size);
 
     var data: []T = try a.allocator.alloc(T, a.data.raw.len);
-    var a_it = IteratorArc(T).init(a);
-    var b_it = IteratorArc(T).init(b);
+    var a_it = Iterator(T).init(a);
+    var b_it = Iterator(T).init(b);
     while (true) {
         const a_next = a_it.next() orelse break;
         const b_next = b_it.next() orelse break;
         data[a_it.index - 1] = a_next + b_next;
     }
+    a_it.deinit();
+    b_it.deinit();
 
     var t = try Tensor(T).initFromOwned(size, data, a.allocator);
-    t.comp_graph = try a.allocator.create(GraphArc(T));
-    t.comp_graph.?.* = try GraphArc(T).init(Op.add, &.{ a, b }, a.allocator);
+    t.comp_graph = try a.allocator.create(Graph(T));
+    t.comp_graph.?.* = try Graph(T).init(Op.add, &.{ a, b }, a.allocator);
     return t;
 }
 
@@ -381,7 +371,7 @@ pub fn _matmul(comptime T: type, a: *Tensor(T), b: *Tensor(T)) !Tensor(T) {
 
     const shared_dim = a.size[a_end];
 
-    // Reshape A and B to (-1, v_size)
+    // Resize A and B to (-1, v_size)
     const a_dim: usize = a.numel() / shared_dim;
     var a_2d = try a.resize(&.{ a_dim, shared_dim });
     defer a_2d.deinit();
@@ -413,8 +403,8 @@ pub fn _matmul(comptime T: type, a: *Tensor(T), b: *Tensor(T)) !Tensor(T) {
     @memcpy(size[a_end..], b.size[1..]);
 
     var t = try Tensor(T).initFromOwned(size, c_data, a.allocator);
-    t.comp_graph = try a.allocator.create(GraphArc(T));
-    t.comp_graph.?.* = try GraphArc(T).init(Op.mul, &.{ a, b }, a.allocator);
+    t.comp_graph = try a.allocator.create(Graph(T));
+    t.comp_graph.?.* = try Graph(T).init(Op.mul, &.{ a, b }, a.allocator);
     return t;
 }
 
@@ -614,7 +604,7 @@ test "Tensor::contiguous" {
     try testing.expectEqualSlices(usize, &expected_size, t_transposed.size);
 }
 
-test "Tensor::reshape" {
+test "Tensor::resize" {
     const allocator = testing.allocator;
     const data = [_]f32{ 1, 2, 3, 4, 5, 6 };
     const size = [_]usize{ 2, 3 };
@@ -652,9 +642,6 @@ test "Tensor::reshape non-contiguous" {
     defer reshaped_t.deinit();
 
     try testing.expectEqual(t_transposed.data.count.load(.monotonic), 2);
-    std.debug.print("t: Count after reshape {}\n", .{t.data.count});
-    std.debug.print("tt: Count after reshape {}\n", .{t_transposed.data.count});
-    std.debug.print("rs: Count after reshape {}\n", .{reshaped_t.data.count});
 
     const expected_data = [_]f32{ 1, 3, 5, 2, 4, 6 };
     const expected_size = [_]usize{ 3, 2 };
@@ -662,8 +649,6 @@ test "Tensor::reshape non-contiguous" {
     try testing.expectEqualSlices(f32, &expected_data, reshaped_t.data.raw);
     try testing.expectEqualSlices(usize, &expected_size, reshaped_t.size);
     try testing.expect(reshaped_t.is_contiguous());
-
-    std.debug.print("clean \n", .{});
 }
 
 test "add" {
