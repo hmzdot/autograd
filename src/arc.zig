@@ -3,26 +3,20 @@ const atomic = std.atomic;
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
-pub fn Arc(comptime T: type) type {
+pub fn ArcArray(comptime T: type) type {
     return struct {
         const Self = @This();
 
         allocator: Allocator,
-        raw: T,
         count: atomic.Value(usize),
-        dropFn: *const fn (T, Allocator) void,
+        raw: []T,
 
         // Init Arc with initial refcount of 1
-        pub fn init(
-            raw: T,
-            dropFn: *const fn (T, Allocator) void,
-            allocator: Allocator,
-        ) Self {
+        pub fn init(raw: []T, allocator: Allocator) Self {
             return Self{
                 .allocator = allocator,
-                .raw = raw,
                 .count = atomic.Value(usize).init(1),
-                .dropFn = dropFn,
+                .raw = raw,
             };
         }
 
@@ -31,7 +25,7 @@ pub fn Arc(comptime T: type) type {
             self.unref();
         }
 
-        pub fn ref(self: *Self) T {
+        pub fn ref(self: *Self) []T {
             _ = self.count.fetchAdd(1, .monotonic);
             return self.raw;
         }
@@ -39,34 +33,20 @@ pub fn Arc(comptime T: type) type {
         pub fn unref(self: *Self) void {
             if (self.count.fetchSub(1, .release) == 1) {
                 _ = self.count.load(.acquire);
-                (self.dropFn)(self.raw, self.allocator);
+                self.allocator.free(self.raw);
             }
         }
     };
 }
 
-test "Arc" {
+test "ArcArray" {
     const allocator = testing.allocator;
-    const Dummy = struct {
-        const Self = @This();
-        data: []u32,
-
-        pub fn init() !Self {
-            var data = try allocator.alloc(u32, 10);
-            for (0..10) |i| data[i] = @intCast(i);
-
-            return Self{ .data = data };
-        }
-
-        pub fn deinit(t: *Self, ator: Allocator) void {
-            ator.free(t.data);
-        }
-    };
 
     // Case 1: Multiple refs
-    var dummy = try Dummy.init();
+    var dummy = try allocator.alloc(u32, 10);
+    for (0..10) |i| dummy[i] = @intCast(i);
 
-    var dummy_rc = Arc(*Dummy).init(&dummy, Dummy.deinit, allocator);
+    var dummy_rc = ArcArray(u32).init(dummy, allocator);
     defer dummy_rc.deinit();
 
     const ref0 = dummy_rc.ref();
@@ -75,12 +55,13 @@ test "Arc" {
     const ref1 = dummy_rc.ref();
     defer dummy_rc.unref();
 
-    try testing.expectEqual(ref0.data[0], 0);
-    try testing.expectEqual(ref1.data[1], 1);
+    try testing.expectEqual(ref0[0], 0);
+    try testing.expectEqual(ref1[1], 1);
 
     // Case 2: No ref
-    var dummy_2 = try Dummy.init();
+    var dummy2 = try allocator.alloc(f32, 10);
+    for (0..10) |i| dummy2[i] = @floatFromInt(i);
 
-    var dummy_rc_2 = Arc(*Dummy).init(&dummy_2, Dummy.deinit, allocator);
+    var dummy_rc_2 = ArcArray(f32).init(dummy2, allocator);
     defer dummy_rc_2.deinit();
 }
