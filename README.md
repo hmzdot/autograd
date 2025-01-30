@@ -9,8 +9,7 @@ in Zig.
 - [x] `Tensor` struct
 - [x] `Tensor` creation
 - [x] `Tensor` addition
-- [x] `Tensor` multiplication
-- [ ] Broadcasting
+- [x] `Tensor` matmul
 
 ### Autograd
 - [x] Computation graph
